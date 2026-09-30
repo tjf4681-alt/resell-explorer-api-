@@ -9,3 +9,5 @@ services:
         value: "1355.25"
       - key: JPY_KRW
         value: "8.65041"
+      - key: PHP_KRW
+        value: "23.70"
