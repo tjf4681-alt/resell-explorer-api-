@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx, re, urllib.parse, asyncio, os
 from bs4 import BeautifulSoup
 
-app = FastAPI(title="Resell Explorer Live API v2", version="2.0.0")
+app = FastAPI(title="Resell Explorer Live API v2.1", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,23 +25,18 @@ UA = {
 USD_KRW = float(os.getenv("USD_KRW", "1355.25"))
 JPY_KRW = float(os.getenv("JPY_KRW", "8.65041"))
 PHP_KRW = float(os.getenv("PHP_KRW", "23.70"))
-
 FX = {"KRW":1.0, "USD":USD_KRW, "JPY":JPY_KRW, "PHP":PHP_KRW}
 
-# mode:
-# direct = open the marketplace search URL directly and generic-parse it
-# ebay/amazon = dedicated parsers
-# google = search Google for site:domain + query, parse results/snippets
 SITE_CONFIG = {
     # 국내 종합/가격비교
     "네이버쇼핑": {"group":"국내 종합/가격비교","mode":"direct","url":lambda q:"https://search.shopping.naver.com/search/all?query="+urllib.parse.quote(q)},
-    "쿠팡": {"group":"국내 종합/가격비교","mode":"google","domain":"coupang.com"},
+    "쿠팡": {"group":"국내 종합/가격비교","mode":"coupang","url":lambda q:"https://www.coupang.com/np/search?q="+urllib.parse.quote(q)},
     "11번가": {"group":"국내 종합/가격비교","mode":"google","domain":"11st.co.kr"},
     "G마켓": {"group":"국내 종합/가격비교","mode":"google","domain":"gmarket.co.kr"},
     "옥션": {"group":"국내 종합/가격비교","mode":"google","domain":"auction.co.kr"},
     "SSG닷컴": {"group":"국내 종합/가격비교","mode":"google","domain":"ssg.com"},
     "롯데ON": {"group":"국내 종합/가격비교","mode":"google","domain":"lotteon.com"},
-    "다나와": {"group":"국내 종합/가격비교","mode":"google","domain":"danawa.com"},
+    "다나와": {"group":"국내 종합/가격비교","mode":"danawa","url":lambda q:"https://search.danawa.com/dsearch.php?query="+urllib.parse.quote(q)},
     "에누리": {"group":"국내 종합/가격비교","mode":"google","domain":"enuri.com"},
     "GS SHOP": {"group":"국내 종합/가격비교","mode":"google","domain":"gsshop.com"},
     "CJ온스타일": {"group":"국내 종합/가격비교","mode":"google","domain":"cj온스타일.com"},
@@ -120,7 +115,8 @@ def extract_price(text):
     return "PHP", float(m.group(4).replace(",","")), m.group(0)
 
 def krw(cur, val):
-    if cur is None or val is None: return None
+    if cur is None or val is None:
+        return None
     return int(round(val * FX.get(cur,1)))
 
 def google_url(domain, q):
@@ -131,94 +127,196 @@ def parse_google(html, site):
     out, seen = [], set()
     for a in soup.select("a"):
         h3 = a.select_one("h3")
-        if not h3: continue
+        if not h3:
+            continue
         title = clean(h3.get_text(" ", strip=True))
-        if not title: continue
+        if not title:
+            continue
         block = clean(a.parent.get_text(" ", strip=True) if a.parent else title)
         cur, val, raw = extract_price(block)
         href = a.get("href","")
-        key=(title,href)
-        if key in seen: continue
+        key = (title, href)
+        if key in seen:
+            continue
         seen.add(key)
         out.append({
-            "site":site,"title":title,
-            "price":raw or "가격 확인 필요",
-            "priceKRW":krw(cur,val),
-            "condition":"",
-            "link":href
+            "site": site,
+            "title": title,
+            "price": raw or "가격 확인 필요",
+            "priceKRW": krw(cur,val),
+            "condition": "",
+            "link": href
         })
-        if len(out)>=15: break
+        if len(out) >= 15:
+            break
+    return out
+
+def parse_coupang(html):
+    soup = BeautifulSoup(html, "html.parser")
+    out, seen = [], set()
+
+    # Coupang current/legacy search result selectors
+    cards = soup.select("li.search-product, li.search-product-wrap, [data-product-id]")
+    for card in cards:
+        title_el = (
+            card.select_one(".name")
+            or card.select_one(".search-product-name")
+            or card.select_one("[class*='ProductUnit_productName']")
+        )
+        price_el = (
+            card.select_one(".price-value")
+            or card.select_one(".price-value.final-price-amount")
+            or card.select_one("[class*='PriceArea_price']")
+        )
+        link_el = card.select_one("a[href]")
+        if not title_el or not link_el:
+            continue
+
+        title = clean(title_el.get_text(" ", strip=True))
+        price_txt = clean(price_el.get_text(" ", strip=True) if price_el else "")
+        digits = re.search(r"([\d,]+)", price_txt)
+        price_krw = int(digits.group(1).replace(",","")) if digits else None
+        href = urllib.parse.urljoin("https://www.coupang.com", link_el.get("href",""))
+        key = (title, href)
+        if title and key not in seen:
+            seen.add(key)
+            out.append({
+                "site":"쿠팡",
+                "title":title,
+                "price":f"₩{price_krw:,}" if price_krw else "가격 확인 필요",
+                "priceKRW":price_krw,
+                "condition":"신품",
+                "link":href
+            })
+        if len(out) >= 30:
+            break
+    return out
+
+def parse_danawa(html):
+    soup = BeautifulSoup(html, "html.parser")
+    out, seen = [], set()
+
+    # Standard Danawa desktop search results
+    cards = soup.select("li.prod_item, div.prod_main_info")
+    for card in cards:
+        title_el = (
+            card.select_one(".prod_name a")
+            or card.select_one(".prod_name")
+            or card.select_one("a[name='productName']")
+        )
+        if not title_el:
+            continue
+
+        title = clean(title_el.get_text(" ", strip=True))
+        href = title_el.get("href","") if title_el.name == "a" else ""
+        if not href:
+            a = card.select_one(".prod_name a[href]")
+            href = a.get("href","") if a else ""
+        href = urllib.parse.urljoin("https://search.danawa.com", href)
+
+        # Lowest visible price
+        price_el = (
+            card.select_one(".price_sect a strong")
+            or card.select_one(".price_sect strong")
+            or card.select_one(".prod_pricelist .price_sect strong")
+            or card.select_one(".price_sect")
+        )
+        price_txt = clean(price_el.get_text(" ", strip=True) if price_el else "")
+        m = re.search(r"([\d,]{4,})", price_txt)
+        price_krw = int(m.group(1).replace(",","")) if m else None
+
+        key = (title, href)
+        if title and key not in seen:
+            seen.add(key)
+            out.append({
+                "site":"다나와",
+                "title":title,
+                "price":f"₩{price_krw:,}" if price_krw else "가격 확인 필요",
+                "priceKRW":price_krw,
+                "condition":"신품",
+                "link":href
+            })
+        if len(out) >= 30:
+            break
     return out
 
 def parse_generic(html, site, base):
     soup = BeautifulSoup(html, "html.parser")
     out, seen = [], set()
 
-    # JSON-LD product offers first
     for script in soup.select('script[type="application/ld+json"]'):
         txt = script.string or script.get_text()
-        if not txt: continue
+        if not txt:
+            continue
         try:
             import json
             data = json.loads(txt)
         except Exception:
             continue
-        objs = data if isinstance(data,list) else [data]
+        objs = data if isinstance(data, list) else [data]
         for obj in objs:
-            if not isinstance(obj,dict) or obj.get("@type")!="Product":
+            if not isinstance(obj, dict) or obj.get("@type") != "Product":
                 continue
-            title=clean(obj.get("name",""))
-            offers=obj.get("offers") or {}
-            if isinstance(offers,list): offers=offers[0] if offers else {}
-            p=offers.get("price")
-            cur=offers.get("priceCurrency")
-            val=None
-            try: val=float(str(p).replace(",","")) if p is not None else None
-            except: pass
-            link=obj.get("url") or base
-            key=(title,link)
+            title = clean(obj.get("name",""))
+            offers = obj.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            p = offers.get("price")
+            cur = offers.get("priceCurrency")
+            val = None
+            try:
+                val = float(str(p).replace(",","")) if p is not None else None
+            except Exception:
+                pass
+            link = obj.get("url") or base
+            key = (title, link)
             if title and key not in seen:
                 seen.add(key)
                 out.append({
                     "site":site,"title":title,
                     "price":f"{cur} {p}" if p is not None else "가격 확인 필요",
                     "priceKRW":krw(cur,val),
-                    "condition":"",
-                    "link":link
+                    "condition":"","link":link
                 })
-            if len(out)>=20: return out
+            if len(out) >= 20:
+                return out
 
-    # Visible text fallback
     for a in soup.select("a[href]"):
-        title=clean(a.get_text(" ",strip=True))
-        if len(title)<6: continue
-        block=clean(a.parent.get_text(" ",strip=True) if a.parent else title)
-        cur,val,raw=extract_price(block)
-        if val is None: continue
-        href=urllib.parse.urljoin(base,a.get("href",""))
-        key=(title[:140],href)
-        if key in seen: continue
+        title = clean(a.get_text(" ", strip=True))
+        if len(title) < 6:
+            continue
+        block = clean(a.parent.get_text(" ", strip=True) if a.parent else title)
+        cur,val,raw = extract_price(block)
+        if val is None:
+            continue
+        href = urllib.parse.urljoin(base, a.get("href",""))
+        key = (title[:140], href)
+        if key in seen:
+            continue
         seen.add(key)
         out.append({
             "site":site,"title":title[:180],
             "price":raw,"priceKRW":krw(cur,val),
             "condition":"","link":href
         })
-        if len(out)>=20: break
+        if len(out) >= 20:
+            break
     return out
 
 def parse_ebay(html):
-    soup=BeautifulSoup(html,"html.parser")
-    out=[]
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
     for li in soup.select("li.s-item"):
-        t=li.select_one(".s-item__title")
-        p=li.select_one(".s-item__price")
-        a=li.select_one("a.s-item__link")
-        if not t or not a: continue
-        title=clean(t.get_text(" ",strip=True))
-        if not title or "Shop on eBay" in title: continue
-        pt=clean(p.get_text(" ",strip=True) if p else "")
-        cur,val,raw=extract_price(pt)
+        t = li.select_one(".s-item__title")
+        p = li.select_one(".s-item__price")
+        a = li.select_one("a.s-item__link")
+        if not t or not a:
+            continue
+        title = clean(t.get_text(" ", strip=True))
+        if not title or "Shop on eBay" in title:
+            continue
+        pt = clean(p.get_text(" ", strip=True) if p else "")
+        cur,val,raw = extract_price(pt)
         out.append({
             "site":"eBay","title":title,
             "price":raw or pt or "가격 확인 필요",
@@ -226,24 +324,27 @@ def parse_ebay(html):
             "condition":clean((li.select_one(".SECONDARY_INFO") or {}).get_text(" ",strip=True) if li.select_one(".SECONDARY_INFO") else ""),
             "link":a.get("href","")
         })
-        if len(out)>=30: break
+        if len(out) >= 30:
+            break
     return out
 
 def parse_amazon(html):
-    soup=BeautifulSoup(html,"html.parser")
-    out=[]
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
     for card in soup.select('[data-component-type="s-search-result"]'):
-        t=card.select_one("h2 span")
-        a=card.select_one("h2 a")
-        if not t: continue
-        title=clean(t.get_text(" ",strip=True))
-        whole=card.select_one(".a-price-whole")
-        frac=card.select_one(".a-price-fraction")
-        pt=""
+        t = card.select_one("h2 span")
+        a = card.select_one("h2 a")
+        if not t:
+            continue
+        title = clean(t.get_text(" ", strip=True))
+        whole = card.select_one(".a-price-whole")
+        frac = card.select_one(".a-price-fraction")
+        pt = ""
         if whole:
-            pt="$"+clean(whole.get_text("",strip=True)).rstrip(".")
-            if frac: pt+="."+clean(frac.get_text("",strip=True))
-        cur,val,raw=extract_price(pt)
+            pt = "$" + clean(whole.get_text("", strip=True)).rstrip(".")
+            if frac:
+                pt += "." + clean(frac.get_text("", strip=True))
+        cur,val,raw = extract_price(pt)
         out.append({
             "site":"Amazon","title":title,
             "price":raw or pt or "가격 확인 필요",
@@ -251,29 +352,81 @@ def parse_amazon(html):
             "condition":"New",
             "link":urllib.parse.urljoin("https://www.amazon.com",a.get("href","")) if a else ""
         })
-        if len(out)>=30: break
+        if len(out) >= 30:
+            break
     return out
 
+async def fetch_html(url, extra_headers=None):
+    headers = dict(UA)
+    if extra_headers:
+        headers.update(extra_headers)
+    async with httpx.AsyncClient(headers=headers, timeout=18.0, follow_redirects=True) as c:
+        return await c.get(url)
+
 async def fetch_site(site,q):
-    cfg=SITE_CONFIG[site]
+    cfg = SITE_CONFIG[site]
     try:
-        if cfg["mode"]=="google":
-            url=google_url(cfg["domain"],q)
+        if cfg["mode"] == "google":
+            url = google_url(cfg["domain"], q)
         else:
-            url=cfg["url"](q)
-        async with httpx.AsyncClient(headers=UA,timeout=18.0,follow_redirects=True) as c:
-            r=await c.get(url)
-        if r.status_code!=200:
+            url = cfg["url"](q)
+
+        extra = {}
+        if site == "쿠팡":
+            extra["Referer"] = "https://www.coupang.com/"
+        elif site == "다나와":
+            extra["Referer"] = "https://www.danawa.com/"
+
+        r = await fetch_html(url, extra)
+
+        # eBay blocks server IPs often: fallback to Google site search automatically.
+        if site == "eBay" and r.status_code in (401,403,429):
+            fallback = await fetch_html(google_url("ebay.com", q))
+            items = parse_google(fallback.text, "eBay")
+            return {
+                "site":site,
+                "ok":True,
+                "items":items,
+                "message":f"eBay direct HTTP {r.status_code} → Google fallback",
+                "fallback":True
+            }
+
+        # Coupang can also block. If direct gave 403/429, use Google fallback.
+        if site == "쿠팡" and r.status_code in (401,403,429):
+            fallback = await fetch_html(google_url("coupang.com", q))
+            items = parse_google(fallback.text, "쿠팡")
+            return {
+                "site":site,
+                "ok":True,
+                "items":items,
+                "message":f"쿠팡 direct HTTP {r.status_code} → Google fallback",
+                "fallback":True
+            }
+
+        if r.status_code != 200:
             return {"site":site,"ok":False,"items":[],"message":f"HTTP {r.status_code}"}
-        if cfg["mode"]=="ebay":
-            items=parse_ebay(r.text)
-        elif cfg["mode"]=="amazon":
-            items=parse_amazon(r.text)
-        elif cfg["mode"]=="google":
-            items=parse_google(r.text,site)
+
+        if cfg["mode"] == "ebay":
+            items = parse_ebay(r.text)
+        elif cfg["mode"] == "amazon":
+            items = parse_amazon(r.text)
+        elif cfg["mode"] == "coupang":
+            items = parse_coupang(r.text)
+            if not items:
+                fallback = await fetch_html(google_url("coupang.com", q))
+                items = parse_google(fallback.text, "쿠팡")
+        elif cfg["mode"] == "danawa":
+            items = parse_danawa(r.text)
+            if not items:
+                fallback = await fetch_html(google_url("danawa.com", q))
+                items = parse_google(fallback.text, "다나와")
+        elif cfg["mode"] == "google":
+            items = parse_google(r.text, site)
         else:
-            items=parse_generic(r.text,site,str(r.url))
+            items = parse_generic(r.text, site, str(r.url))
+
         return {"site":site,"ok":True,"items":items,"message":"ok"}
+
     except Exception as e:
         return {"site":site,"ok":False,"items":[],"message":str(e)[:160]}
 
@@ -281,14 +434,14 @@ async def fetch_site(site,q):
 async def root():
     return {
         "ok":True,
-        "service":"Resell Explorer Live API v2",
+        "service":"Resell Explorer Live API v2.1",
         "supported_count":len(SITE_CONFIG),
-        "groups":sorted(set(v["group"] for v in SITE_CONFIG.values()))
+        "changes":["쿠팡 전용 파서","다나와 전용 파서","eBay 403 fallback"]
     }
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"supported_count":len(SITE_CONFIG)}
+    return {"ok":True,"version":"2.1.0","supported_count":len(SITE_CONFIG)}
 
 @app.get("/sites")
 async def sites():
@@ -299,29 +452,31 @@ async def sites():
 
 @app.get("/search")
 async def search(q:str=Query(...,min_length=1), sites:str=""):
-    requested=[s for s in sites.split(",") if s]
-    selected=[s for s in requested if s in SITE_CONFIG] if requested else list(SITE_CONFIG.keys())
+    requested = [s for s in sites.split(",") if s]
+    selected = [s for s in requested if s in SITE_CONFIG] if requested else list(SITE_CONFIG.keys())
 
-    # Avoid hammering everything at once; batch concurrency.
-    sem=asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(8)
     async def guarded(site):
         async with sem:
             return await fetch_site(site,q)
 
-    results=await asyncio.gather(*(guarded(s) for s in selected))
-    items=[]
-    logs=[]
+    results = await asyncio.gather(*(guarded(s) for s in selected))
+    items = []
+    logs = []
+
     for r in results:
         if r["ok"]:
             items.extend(r["items"])
-            logs.append(f"[{r['site']}] {len(r['items'])}건")
+            suffix = f" · {r['message']}" if r.get("message") and r["message"] != "ok" else ""
+            logs.append(f"[{r['site']}] {len(r['items'])}건{suffix}")
         else:
             logs.append(f"[{r['site']}] 실패/제약: {r['message']}")
 
-    items.sort(key=lambda x:(x.get("priceKRW") is None,x.get("priceKRW") or 10**18))
+    items.sort(key=lambda x:(x.get("priceKRW") is None, x.get("priceKRW") or 10**18))
 
     return {
         "ok":True,
+        "version":"2.1.0",
         "query":q,
         "requested_sites":requested,
         "searched_sites":selected,
