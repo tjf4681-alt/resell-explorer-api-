@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: resell-explorer-api
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: USD_KRW
+        value: "1355.25"
+      - key: JPY_KRW
+        value: "8.65041"
